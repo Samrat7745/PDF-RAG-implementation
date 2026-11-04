@@ -1,0 +1,13 @@
+# LangChain Ollama models and core document abstractions
+langchain-ollama
+langchain-community
+langchain-huggingface
+langchain-text-splitters
+
+# Dense retrieval and embedding model
+faiss-cpu
+sentence-transformers
+
+# PDF text and diagram extraction, and progress output
+PyMuPDF
+tqdm

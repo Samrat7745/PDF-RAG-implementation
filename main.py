@@ -1,138 +1,127 @@
-import os
+"""Run interactive question answering over the previously built RAG index."""
 
-from langchain_ollama import ChatOllama
-from langchain_core.documents import Document
-from langchain_community.document_loaders import DirectoryLoader
-from langchain_community.document_loaders import UnstructuredPDFLoader
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import RetrievalQA
-from helpers.image_extraction import DiagramExtractor
-from helpers.image_to_description import DiagramDescriber
-from tqdm import tqdm
-import json
+from langchain_ollama import ChatOllama
 
-## diagram cropper/separator for the describer to create descriptions
-diagrams = DiagramExtractor("./pdfs/","./extracted_diagrams")
-diagrams.extract_diagrams_by_captions()
+from helpers.hybrid_retriever import BM25Index, HybridRetriever
+from helpers.multimodal_qa import MultimodalRAGAnswerer
+from helpers.rag_storage import DocumentCorpusStore
 
-## Image describer creates a description for each diagram/graph and ignores other types of images
-Describer = DiagramDescriber()
-image_descriptions = []
-# Filter valid files first so tqdm knows the exact total count
-image_files = [
-    f for f in os.listdir(diagrams.output_dir) 
-    if os.path.isfile(os.path.join(diagrams.output_dir, f))
-]
-if not os.path.exists("image_descriptions.json"):
-    for image_name in tqdm(image_files, desc="Describing diagrams"):
-        image_path = os.path.join(diagrams.output_dir, image_name)
-        image_descriptions.append(
-            Document(
-                page_content=Describer.describe_diagram(image_path),
-                metadata={"source": image_path, "type": "image_description"},
-            )
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+VECTORSTORE_DIRECTORY = PROJECT_ROOT / "vectorstore"
+TEXT_MODEL = "llama3.2"
+VISION_MODEL = "llava"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+
+def load_retriever() -> HybridRetriever:
+    """Load persisted FAISS and corpus artifacts and construct hybrid search."""
+    faiss_path = VECTORSTORE_DIRECTORY / "index.faiss"
+    if not faiss_path.is_file():
+        raise FileNotFoundError(
+            f"RAG index not found at {faiss_path}. Run 'python create_rag.py' first."
         )
-    docs_dict_list = [
-        {"page_content": doc.page_content, "metadata": doc.metadata}
-        for doc in image_descriptions
-    ]
-    with open("image_descriptions.json", "w", encoding="utf-8") as f:
-        json.dump(docs_dict_list, f, indent=4)
 
-    print("Saved image descriptions to image_descriptions.json")
-
-
-loader = DirectoryLoader(
-    "./pdfs/",
-    glob="**/*.pdf",
-    loader_cls=UnstructuredPDFLoader,
-    loader_kwargs={
-        "mode": "single",
-        "strategy": "hi_res",
-        "pdf_infer_table_structure": True
-    }
-)
-pages = loader.load()
-
-if os.path.exists("image_descriptions.json"):
-    print("Loading existing image descriptions from JSON...")
-    with open("image_descriptions.json", "r", encoding="utf-8") as f:
-        loaded_dicts = json.load(f)
-        
-    # Reconstruct the LangChain Document objects
-    image_descriptions = [
-        Document(page_content=item["page_content"], metadata=item["metadata"])
-        for item in loaded_dicts
-    ]
-
-# The directory where you want to save the files
-
-index_directory = "./vectorstore"
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-# Check if we already built and saved the database
-if os.path.exists(index_directory):
-    print(f"Found existing vector store at {index_directory}. Loading it directly...")
+    corpus_store = DocumentCorpusStore(
+        VECTORSTORE_DIRECTORY / "document_chunks.json", PROJECT_ROOT
+    )
+    chunks = corpus_store.load()
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
     vectorstore = FAISS.load_local(
-        index_directory, 
-        embeddings, 
-        allow_dangerous_deserialization=True 
+        str(VECTORSTORE_DIRECTORY),
+        embeddings,
+        allow_dangerous_deserialization=True,
     )
-else:
-    print("No existing vector store found. Building it from scratch...")
-    
-    # 1. Load PDFs
-    loader = DirectoryLoader(
-        "./pdfs/",
-        glob="**/*.pdf",
-        loader_cls=UnstructuredPDFLoader,
-        loader_kwargs={
-            "mode": "single",
-            "strategy": "hi_res",
-            "pdf_infer_table_structure": True
-        }
+    return HybridRetriever(
+        vectorstore=vectorstore,
+        sparse_index=BM25Index(chunks),
+        k=4,
+        candidate_k=20,
+        dense_weight=0.5,
+        sparse_weight=0.5,
     )
-    pages = loader.load()
-
-    # 2. Split and Combine
-    print("Splitting documents...")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    documents = pages + image_descriptions
-    splits = text_splitter.split_documents(documents)
-
-    # 3. Embed and Build
-    print("Creating FAISS index...")
-    vectorstore = FAISS.from_documents(splits, embeddings)
-    
-    # 4. Save for next time
-    vectorstore.save_local(index_directory)
-    print(f"Vector store saved to {index_directory}")
 
 
-llm = ChatOllama(model="llama3.2", temperature=0)
+def paraphrase_prompt(question: str, llm: ChatOllama) -> str:
+    """Correct the question's wording without changing or expanding its meaning."""
+    response = llm.invoke(
+        "Correct only the spelling, grammar, and punctuation in the question below. "
+        "Keep the same meaning and all names and technical terms. Do not answer it, "
+        "explain your edits, or add search instructions. Return only the corrected "
+        f"question.\n\nQuestion: {question}"
+    )
+    rewritten_query = str(response.content).strip().strip('"\'')
+    if not rewritten_query or len(rewritten_query) > max(len(question) * 3, 160):
+        return question
+    if any(marker in rewritten_query.casefold() for marker in ("search for context", "rewritten query:")):
+        return question
+    return rewritten_query
 
-# prompt = ChatPromptTemplate.from_messages([
-#     ("system", "You are a Senior Teacher with expertise in teaching English as a second language. You are tasked with creating a lesson plan for a group of intermediate-level students. The lesson should focus on improving their conversational skills, vocabulary, and grammar. Please provide a detailed lesson plan that includes objectives, activities, and assessment methods."),
-#     ("user", "{input}")
-# ])
 
-retriever = vectorstore.as_retriever()
+def answer_question(
+    question: str,
+    retriever: HybridRetriever,
+    paraphrase_query: bool = True,
+) -> str:
+    """Optionally rewrite the search query, retrieve context, and answer."""
+    text_llm = ChatOllama(model=TEXT_MODEL, temperature=0)
+    search_query = paraphrase_prompt(question, text_llm) if paraphrase_query else question
+    if paraphrase_query:
+        print(f"Search query: {search_query}")
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    return_source_documents=True,  # to get source documents with answers
-    chain_type="stuff",            # concatenates retrieved docs into prompt
-)
+    answerer = MultimodalRAGAnswerer(
+        llm=text_llm,
+        vision_llm=ChatOllama(model=VISION_MODEL, temperature=0),
+        max_images=7,
+    )
+    search_queries = [question]
+    if search_query.casefold() != question.casefold():
+        search_queries.append(search_query)
+    source_documents = retriever.retrieve_queries(search_queries)
+    answer = answerer.invoke(question, source_documents)
 
-query = "Explain me Kimi architectures."
+    print("\nAnswer:")
+    print(answer)
+    print("\nSources:")
+    text_sources = MultimodalRAGAnswerer.answer_sources(source_documents)
+    for index, document in enumerate(text_sources, start=1):
+        source = document.metadata.get("source", "unknown")
+        page = document.metadata.get("page")
+        page_info = f", page {page}" if page is not None else ""
+        print(f"[Source {index}] {source}{page_info}")
+    return answer
 
-result = qa_chain.invoke({"query": query})
 
-print("Answer:", result['result'])
-print("\nSource Documents:")
-for doc in result['source_documents']:
-    print(f"- {doc.page_content}")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ask a question about indexed PDFs.")
+    parser.add_argument(
+        "query",
+        nargs="?",
+        help="Question to ask; omit it to enter a question interactively.",
+    )
+    parser.add_argument(
+        "--no-paraphrase",
+        action="store_true",
+        help="Use the original question as-is for retrieval.",
+    )
+    args = parser.parse_args()
+    question = args.query or input("Question: ").strip()
+    if not question:
+        raise SystemExit("A non-empty question is required.")
+
+    answer_question(
+        question,
+        load_retriever(),
+        paraphrase_query=not args.no_paraphrase,
+    )
+
+
+if __name__ == "__main__":
+    main()
